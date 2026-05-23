@@ -1,0 +1,13 @@
+node_modules/
+bun.lockb
+.env
+.env.local
+data/*.db
+data/*.db-journal
+data/scratch/
+data/arch-docs/*.md
+data/reports/
+targets/*/
+!targets/.gitkeep
+*.log
+.DS_Store
