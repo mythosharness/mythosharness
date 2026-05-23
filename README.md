@@ -97,6 +97,8 @@ Replies arrive on the schedule set by `REPORT_INTERVAL_MIN`.
 
 ## Connecting other models via Thomas
 
+![Thomas dashboard scoring a mythosharness run](docs/screenshots/thomas-dashboard.png)
+
 The harness calls models through `@anthropic-ai/sdk`. To run it on a
 **different** model — GPT-5.5, DeepSeek V4, Gemini, an OpenRouter route, a
 self-hosted vLLM, anything OpenAI-compatible — install
