@@ -22,6 +22,11 @@ function envInt(key: string, fallback: number): number {
 export const config = {
   anthropic: {
     apiKey: env("ANTHROPIC_API_KEY", ""),
+    // Optional override. `thomas wire` typically sets this in the env for us;
+    // explicit overrides go here. The Anthropic SDK reads ANTHROPIC_BASE_URL
+    // natively, but we surface it on the config so it's visible at the
+    // harness level too.
+    baseURL: envOpt("ANTHROPIC_BASE_URL"),
     models: {
       hunter: env("MODEL_HUNTER", "claude-opus-4-7"),
       validator: env("MODEL_VALIDATOR", "claude-sonnet-4-6"),

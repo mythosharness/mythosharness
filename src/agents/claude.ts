@@ -11,7 +11,12 @@ let _client: Anthropic | null = null;
 function client(): Anthropic {
   if (_client) return _client;
   requireAnthropic();
-  _client = new Anthropic({ apiKey: config.anthropic.apiKey });
+  _client = new Anthropic({
+    apiKey: config.anthropic.apiKey,
+    // Pass baseURL through if set — supports routing via Thomas or any
+    // Anthropic-compatible proxy. Undefined → SDK uses its default.
+    ...(config.anthropic.baseURL ? { baseURL: config.anthropic.baseURL } : {}),
+  });
   return _client;
 }
 

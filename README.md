@@ -1,9 +1,22 @@
 # mythosharness
 
-A specialized, long-running, **self-evolving** vulnerability-discovery harness.
+A long-running, **self-evolving** vulnerability-discovery harness that gives
+**any strong coding model** Mythos-class output.
 
-Inspired by Cloudflare's Mythos pipeline (Recon → Hunt → Validate → Gapfill →
-Dedupe → Trace → Report) and extended with:
+The thesis: Cloudflare's Mythos paper showed a specialized security model can
+chain low-severity bugs into working exploits — but most of the gap between a
+generic coding agent and Mythos isn't the model, it's the **harness**. Build
+the right Recon → Hunt → Validate → Gapfill → Report pipeline around any
+strong coding model (Opus 4.7, GPT-5.5, DeepSeek V4, Gemini, …) and you can
+approach the same output. This repo is that harness.
+
+The codebase is written against `@anthropic-ai/sdk` for ergonomic reasons —
+adaptive thinking, tool use, prompt caching all land cleanly. To point it at
+a non-Anthropic model, route the SDK's traffic through **Thomas**, the
+open-source agent wire harness — see [Connecting other models](#connecting-other-models-via-thomas)
+below.
+
+The harness extends the Mythos pipeline with three things Mythos doesn't have:
 
 - **Email-driven I/O** — the operator gives instructions by email; the harness
   emails back hourly/daily reports of confirmed vulnerabilities.
@@ -62,7 +75,7 @@ bun install
 cp .env.example .env  # fill in keys
 bun run start         # forever loop
 bun run once          # one pipeline tick, useful for debugging
-bun run smoke         # tests against the demo vulnerable fixture
+bun run smoke         # unit tests
 ```
 
 The operator emails the address in `MAIL_USER`. Recognised commands:
@@ -82,14 +95,50 @@ body:    use-after-free in src/parser/
 
 Replies arrive on the schedule set by `REPORT_INTERVAL_MIN`.
 
+## Connecting other models via Thomas
+
+The harness calls models through `@anthropic-ai/sdk`. To run it on a
+**different** model — GPT-5.5, DeepSeek V4, Gemini, an OpenRouter route, a
+self-hosted vLLM, anything OpenAI-compatible — install
+[Thomas][thomas] and let it sit on the wire. Thomas is the open-source agent
+harness layer that handles capture, decode, routing, and outcome scoring:
+
+```bash
+npm install -g @openthomas/thomas
+
+thomas wire                  # detect agents, install taps, start daemon
+# …run the harness as usual…
+bun run start
+thomas thomas                # see your T score (verified outcome / AI cost)
+thomas                       # open the dashboard at http://localhost:9877
+```
+
+`thomas wire` is byte-exact reversible — `thomas unwire` restores every file
+it touched. No telemetry, no cloud, no rewrites to this repo.
+
+**Why Thomas is a particularly good fit for this harness:**
+
+- Mythosharness produces *verifiable* outputs (reproduced PoCs). Thomas's
+  `T_verified` metric — which scores only outcomes whose tool_result reports
+  success — is exactly the right lens for a vulnerability-research run.
+  *"19 failed attempts on a vulnerability search don't get scored as 19 wins."*
+- Long, unattended runs (the whole point of this harness) are what make a
+  flight recorder valuable. You can `thomas replay` any hunter that emitted
+  a finding to understand what it actually did.
+- Risk flags surface destructive shell, secret leak, and retry-storm patterns
+  in agent traffic — useful safety rails on top of our own sandbox argv
+  whitelist.
+
+[thomas]: https://github.com/openthomas-com/thomas
+
 ## Layout
 
 | Path                 | Role                                                |
 |----------------------|-----------------------------------------------------|
 | `src/orchestrator/`  | Long-running main loop + task queue                 |
-| `src/stages/`        | recon / hunt / validate / gapfill / dedupe / trace / report |
-| `src/agents/`        | Claude tool-use loop, subagent spawn, prompt cache  |
-| `src/sandbox/`       | Per-task scratch dirs, sandboxed exec, build detect |
+| `src/stages/`        | recon / hunt / validate / gapfill / report          |
+| `src/agents/`        | Tool-use loop, prompt caching                       |
+| `src/sandbox/`       | Per-task scratch dirs, sandboxed exec               |
 | `src/memory/`        | Findings DB, arch docs, skill loader                |
 | `src/email/`         | IMAP poller + SMTP reporter                         |
 | `src/github/`        | Auto-commit/push, self-mutation guard               |
@@ -109,3 +158,5 @@ Replies arrive on the schedule set by `REPORT_INTERVAL_MIN`.
 - The harness refuses to operate on targets the operator hasn't explicitly
   added via email.
 - `KILL_SWITCH=1` halts the orchestrator on the next tick.
+- If running under Thomas, the `T_verified` score and full action trace
+  give you an independent audit trail of what every hunter actually did.
