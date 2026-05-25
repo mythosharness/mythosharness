@@ -62,7 +62,6 @@ export async function runAgent(args: AgentRunArgs): Promise<AgentRunResult> {
     system: systemBlocks,
     tools: args.tools.map(toAnthropicTool),
     messages,
-    stream: true,
   } as unknown as Record<string, unknown>;
   if (args.thinking !== false) {
     requestParams.thinking = { type: "adaptive" };
@@ -253,14 +252,9 @@ export async function quickAsk(opts: {
     max_tokens: opts.maxTokens ?? 8_000,
     system: opts.system,
     messages: [{ role: "user", content: opts.user }],
-    stream: true,
-  } as unknown as Anthropic.MessageStreamParams);
-  const chunks: Anthropic.TextBlock[] = [];
-  for await (const chunk of r as AsyncIterable<Record<string, unknown>>) {
-    if ((chunk as Record<string, unknown>).type === "content_block_delta") {
-      const delta = (chunk as Record<string, unknown>).delta as Record<string, unknown>;
-      if (delta.type === "text_delta") chunks.push({ type: "text", text: delta.text as string });
-    }
-  }
-  return chunks.map((b) => b.text).join("\n");
+  } as unknown as Anthropic.MessageCreateParamsNonStreaming);
+  return r.content
+    .filter((b): b is Anthropic.TextBlock => b.type === "text")
+    .map((b) => b.text)
+    .join("\n");
 }
