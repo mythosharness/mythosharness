@@ -193,8 +193,8 @@ export async function runRecon(target: Target): Promise<void> {
       state: {},
     },
     maxIterations: 40,
-    maxTokens: 32_000,
-    effort: "high",
+    maxTokens: 16_000,
+    thinking: false,
   });
 
   const final = captured.value;
