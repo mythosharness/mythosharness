@@ -55,6 +55,9 @@ function client(): Anthropic {
 export async function runAgent(args: AgentRunArgs): Promise<AgentRunResult> {
   const c = client();
   const toolMap = new Map(args.tools.map((t) => [t.name, t]));
+  const terminalMap = new Map(
+    args.tools.filter((t) => (t as any).terminal).map((t) => [t.name, t])
+  );
   const maxIter = args.maxIterations ?? 20;
   const maxTokens = args.maxTokens ?? 32_000;
 
