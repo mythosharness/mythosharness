@@ -125,6 +125,7 @@ export async function runAgent(args: AgentRunArgs): Promise<AgentRunResult> {
     const textParts: string[] = [];
     const toolCalls: { id: string; name: string; input: Record<string, unknown> }[] = [];
 
+    console.log(`[DEBUG] stop_reason=${msg.stop_reason} content=${JSON.stringify(msg.content).slice(0,300)}`);
     for (const block of msg.content) {
       if (block.type === "text") {
         textParts.push(block.text);
