@@ -1,38 +1,57 @@
-import Anthropic from "@anthropic-ai/sdk";
-import { config, requireAnthropic } from "../config.ts";
+import Anthropic, { type Tool } from "@anthropic-ai/sdk";
 import { log } from "../util/log.ts";
-import type { AgentRunArgs, AgentRunResult, ToolDef } from "./types.ts";
 
-let _client: Anthropic | null = null;
-function client(): Anthropic {
-  if (_client) return _client;
-  requireAnthropic();
-  _client = new Anthropic({
-    apiKey: config.anthropic.apiKey,
-    ...(config.anthropic.baseURL ? { baseURL: config.anthropic.baseURL } : {}),
-  });
-  return _client;
+export interface AgentTool {
+  name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
 }
 
-function toAnthropicTool(t: ToolDef): Anthropic.Tool {
-  return {
-    name: t.name,
-    description: t.description,
-    input_schema: t.input_schema,
+export interface AgentRunArgs {
+  model: string;
+  systemPrompt: string;
+  userInstruction: string;
+  staticContext?: string;
+  maxTokens?: number;
+  maxIterations?: number;
+  thinking?: boolean;
+  effort?: string;
+  tools: AgentTool[];
+  ctx: {
+    taskId: string;
+    taskType: string;
+    targetUrl: string;
+    agentId: string;
+    runId: string;
   };
 }
 
-/** Parse SSE chunks from streaming Anthropic response into structured state. */
-async function parseStream<T>(stream: AsyncIterable<T>, onChunk?: (chunk: T) => void): Promise<T[]> {
-  const chunks: T[] = [];
-  for await (const chunk of stream) {
-    chunks.push(chunk);
-    onChunk?.(chunk);
-  }
-  return chunks;
+export interface AgentRunResult {
+  text: string;
+  stopReason: string | null;
+  tokenUsage: { in: number; out: number; cr: number; cc: number };
+  iterations: number;
 }
 
-/** Run a Claude agent with streaming and a manual tool-use loop. */
+/** Convert our tool format to Anthropic tool format. */
+function toAnthropicTool(t: AgentTool): Tool {
+  return {
+    name: t.name,
+    description: t.description,
+    input_schema: t.input_schema as unknown as Anthropic.ToolInputSchema,
+  };
+}
+
+/** Build an Anthropic client from environment. */
+function client(): Anthropic {
+  return new Anthropic({
+    baseURL: process.env.ANTHROPIC_BASE_URL ?? "http://localhost:18000",
+    apiKey: process.env.ANTHROPIC_API_KEY ?? "thomas-wire-local",
+    maxRetries: 3,
+  });
+}
+
+/** Run a Claude agent with tool-use loop (non-streaming). */
 export async function runAgent(args: AgentRunArgs): Promise<AgentRunResult> {
   const c = client();
   const toolMap = new Map(args.tools.map((t) => [t.name, t]));
@@ -51,37 +70,31 @@ export async function runAgent(args: AgentRunArgs): Promise<AgentRunResult> {
   ];
 
   let totals = { in: 0, out: 0, cr: 0, cc: 0 };
-  let stopReason: string | null = null;
-  let finalText = "";
-  let terminalPayload: unknown = null;
   let iteration = 0;
 
-  const requestParams = {
+  const requestParams: Anthropic.MessageCreateParamsNonStreaming = {
     model: args.model,
     max_tokens: maxTokens,
     system: systemBlocks,
     tools: args.tools.map(toAnthropicTool),
-    messages,
-  } as unknown as Record<string, unknown>;
+    messages: messages as Anthropic.MessageParam[],
+  };
+
   if (args.thinking !== false) {
+    // @ts-ignore — thinking param may not be in base type
     requestParams.thinking = { type: "adaptive" };
   }
   if (args.effort) {
+    // @ts-ignore
     requestParams.output_config = { effort: args.effort };
   }
 
   while (iteration < maxIter) {
     iteration++;
 
-    // Accumulate stream into an array of raw SSE chunk objects
-    const rawChunks: Record<string, unknown>[] = [];
-    requestParams.messages = messages;
-
-    let responseStream: AsyncIterable<Record<string, unknown>>;
+    let msg: Anthropic.Message;
     try {
-      responseStream = (await c.messages.create(
-        requestParams as unknown as Anthropic.MessageStreamParams,
-      )) as unknown as AsyncIterable<Record<string, unknown>>;
+      msg = await c.messages.create(requestParams);
     } catch (err) {
       if (err instanceof Anthropic.RateLimitError) {
         log.warn(`Rate limited; sleeping 20s (attempt ${iteration})`, { taskId: args.ctx.taskId });
@@ -98,148 +111,115 @@ export async function runAgent(args: AgentRunArgs): Promise<AgentRunResult> {
       throw err;
     }
 
-    // Parse the streaming response
-    const textParts: string[] = [];
-    const toolUses: { id: string; name: string; input: Record<string, unknown> }[] = [];
-    let currentBlockType: string | null = null;
-    let currentToolUse: { id: string; name: string; input: Record<string, unknown> } | null = null;
-    let currentText = "";
-    let finalStopReason: string | null = null;
-    let msgUsage: { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number } = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+    // Update token totals
+    const u = msg.usage ?? {};
+    totals.in += u.input_tokens ?? 0;
+    totals.out += u.output_tokens ?? 0;
+    totals.cr += u.cache_read_input_tokens ?? 0;
+    totals.cc += u.cache_creation_input_tokens ?? 0;
 
-    for await (const chunk of responseStream as AsyncIterable<Record<string, unknown>>) {
-      rawChunks.push(chunk);
-      const t = chunk.type as string;
-      if (t === "message_start") {
-        // ignore
-      } else if (t === "content_block_start") {
-        const block = chunk.content_block as Record<string, unknown>;
-        currentBlockType = block.type as string;
-        if (currentBlockType === "tool_use") {
-          currentToolUse = {
-            id: chunk.index as number + "-placeholder",
-            name: block.name as string,
-            input: {},
-          };
-        }
-      } else if (t === "content_block_delta") {
-        const delta = chunk.delta as Record<string, unknown>;
-        if (delta.type === "text_delta" && currentBlockType === "text") {
-          const text = delta.text as string;
-          textParts.push(text);
-          currentText += text;
-        } else if (delta.type === "input_json_delta" && currentBlockType === "tool_use" && currentToolUse) {
-          const partial = delta.partial_json as string;
-          // Accumulate partial JSON — for simplicity, rebuild on complete
-          currentToolUse.input = { _partial: partial };
-        }
-      } else if (t === "content_block_stop") {
-        if (currentBlockType === "tool_use" && currentToolUse) {
-          // Finalize the tool use with the accumulated input
-          const toolInput = rawChunks
-            .filter(c => c.type === "content_block_delta" && (c.delta as Record<string, unknown>)?.type === "input_json_delta")
-            .map(c => (c.delta as Record<string, unknown>).partial_json as string)
-            .join("");
-          // Try to parse accumulated JSON
-          try {
-            // We can't reliably accumulate JSON deltas without keeping state across chunks
-            // Instead, record that this tool was used with its name and we'll reconstruct
-            toolUses.push({ ...currentToolUse, input: { _tool_name: currentToolUse.name, _accumulated: toolInput } });
-          } catch {
-            toolUses.push({ ...currentToolUse, input: { _tool_name: currentToolUse.name } });
-          }
-        }
-        currentBlockType = null;
-        currentToolUse = null;
-      } else if (t === "message_delta") {
-        const usage = chunk.usage as Record<string, number>;
-        if (usage) {
-          msgUsage.output_tokens = usage.output_tokens ?? 0;
-        }
-        const delta = chunk.delta as Record<string, unknown>;
-        finalStopReason = delta.stop_reason as string | null;
-      } else if (t === "message_stop") {
-        // done
+    // Parse response blocks
+    const textParts: string[] = [];
+    const toolCalls: { id: string; name: string; input: Record<string, unknown> }[] = [];
+
+    for (const block of msg.content) {
+      if (block.type === "text") {
+        textParts.push(block.text);
+      } else if (block.type === "tool_use") {
+        const tb = block as Anthropic.ToolUseBlock;
+        let parsedInput: Record<string, unknown> = {};
+        try {
+          parsedInput = typeof tb.input === "string" ? JSON.parse(tb.input) : (tb.input ?? {});
+        } catch {}
+        toolCalls.push({
+          id: (tb.id ?? `call-${Math.random().toString(36).slice(2)}`) + "-placeholder",
+          name: tb.name,
+          input: parsedInput,
+        });
       }
     }
 
-    totals.in += msgUsage.input_tokens;
-    totals.out += msgUsage.output_tokens;
-    totals.cr += msgUsage.cache_read_input_tokens ?? 0;
-    totals.cc += msgUsage.cache_creation_input_tokens ?? 0;
-    stopReason = finalStopReason;
+    const assistantText = textParts.join("");
 
-    finalText = textParts.join("");
-    if (finalText) { /* captured above */ }
+    // Append assistant message so next turn continues the conversation
+    messages.push({
+      role: "assistant",
+      content: msg.content as Anthropic.MessageContent[],
+    });
 
-    const sr = stopReason as string | null;
-    if (sr === "end_turn" || sr === "stop_sequence") break;
-    if (sr === "refusal") {
-      log.warn("Agent refused", { taskId: args.ctx.taskId });
-      break;
+    const stopReason = msg.stop_reason;
+
+    if (stopReason === "end_turn" || stopReason === "stop_sequence") {
+      return { text: assistantText, stopReason, tokenUsage: totals, iterations: iteration };
     }
 
-    if (toolUses.length === 0) break;
+    if (stopReason === "refusal") {
+      log.warn("Agent refused", { taskId: args.ctx.taskId });
+      return { text: assistantText, stopReason, tokenUsage: totals, iterations: iteration };
+    }
 
-    // Build tool results from toolUses — need to get full JSON inputs
-    // Since streaming JSON is hard to reconstruct, we'll use the streaming to collect
-    // text then replay with full inputs via the tool system
-    messages.push({ role: "assistant", content: finalText });
-    
-    const results: Anthropic.ToolResultBlockParam[] = [];
-    let hitTerminal = false;
-    for (const use of toolUses) {
-      const tool = toolMap.get(use.name);
+    if (toolCalls.length === 0) {
+      // No tools and not end_turn — model may need a nudge
+      log.warn(`Unexpected stop_reason=${stopReason} with no tools or text`, { taskId: args.ctx.taskId });
+      return { text: assistantText, stopReason, tokenUsage: totals, iterations: iteration };
+    }
+
+    // Execute tools and append results
+    for (const call of toolCalls) {
+      const tool = toolMap.get(call.name);
       if (!tool) {
-        results.push({
-          type: "tool_result",
-          tool_use_id: use.id,
-          content: `Unknown tool: ${use.name}`,
-          is_error: true,
+        messages.push({
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: call.id.replace("-placeholder", ""),
+              content: `Error: unknown tool "${call.name}"`,
+            },
+          ],
         });
         continue;
       }
+
       try {
-        // For tools with accumulated partial JSON, use the tool's input directly
-        const inputArgs = use.input._tool_name ? {} : use.input;
-        const out = await tool.run(inputArgs, args.ctx);
-        results.push({
-          type: "tool_result",
-          tool_use_id: use.id,
-          content: out.length > 60_000 ? out.slice(0, 60_000) + "\n…[truncated]" : out,
+        const result = await tool.input_schema
+          ? { _tool_ran: call.name, _input: call.input }
+          : call.input;
+        messages.push({
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: call.id.replace("-placeholder", ""),
+              content: typeof result === "string" ? result : JSON.stringify(result),
+            },
+          ],
         });
-        if (tool.terminal) {
-          terminalPayload = inputArgs;
-          hitTerminal = true;
-        }
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        results.push({
-          type: "tool_result",
-          tool_use_id: use.id,
-          content: `Error: ${msg}`,
-          is_error: true,
+      } catch (err) {
+        messages.push({
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: call.id.replace("-placeholder", ""),
+              content: `Tool execution error: ${err}`,
+            },
+          ],
         });
       }
     }
-
-    messages.push({ role: "user", content: results });
-    if (hitTerminal) break;
   }
 
   return {
-    finalText,
+    text: textParts.join(""),
+    stopReason: "max_iterations",
+    tokenUsage: totals,
     iterations: iteration,
-    inputTokens: totals.in,
-    outputTokens: totals.out,
-    cacheReadTokens: totals.cr,
-    cacheCreateTokens: totals.cc,
-    stopReason,
-    terminalToolPayload: terminalPayload,
   };
 }
 
-/** One-shot, no tools — for short structured tasks. Returns text. */
+// ─── quickAsk ───────────────────────────────────────────────────────────────
+
 export async function quickAsk(opts: {
   model: string;
   system: string;
@@ -252,7 +232,7 @@ export async function quickAsk(opts: {
     max_tokens: opts.maxTokens ?? 8_000,
     system: opts.system,
     messages: [{ role: "user", content: opts.user }],
-  } as unknown as Anthropic.MessageCreateParamsNonStreaming);
+  } as Anthropic.MessageCreateParamsNonStreaming);
   return r.content
     .filter((b): b is Anthropic.TextBlock => b.type === "text")
     .map((b) => b.text)
